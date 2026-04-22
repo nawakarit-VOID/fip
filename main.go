@@ -73,6 +73,15 @@ func unzip(src, dest string) error {
 	}
 	defer r.Close()
 
+	// สร้างโฟลเดอร์จากชื่อ zip
+	base := filepath.Base(src)
+	name := base[:len(base)-len(filepath.Ext(base))]
+	dest = filepath.Join(dest, name)
+
+	if err := os.MkdirAll(dest, os.ModePerm); err != nil {
+		return err
+	}
+
 	for _, f := range r.File {
 		fpath := filepath.Join(dest, f.Name)
 
