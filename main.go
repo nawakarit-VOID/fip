@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -82,37 +83,68 @@ func unzip(src, dest string) error {
 		return err
 	}
 
+	// ===== Parallel unzip =====
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(r.File))
+
+	// จำกัดจำนวน worker กัน disk ตัน
+	sem := make(chan struct{}, 4) // ปรับได้ตาม CPU/SSD
+
 	for _, f := range r.File {
-		fpath := filepath.Join(dest, f.Name)
+		f := f
+		wg.Add(1)
 
-		if f.FileInfo().IsDir() {
-			os.MkdirAll(fpath, os.ModePerm)
-			continue
-		}
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-		if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
-			return err
-		}
+			fpath := filepath.Join(dest, f.Name)
 
-		outFile, err := os.Create(fpath)
-		if err != nil {
-			return err
-		}
+			if f.FileInfo().IsDir() {
+				os.MkdirAll(fpath, os.ModePerm)
+				return
+			}
 
-		rc, err := f.Open()
-		if err != nil {
-			return err
-		}
+			if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+				errChan <- err
+				return
+			}
 
-		_, err = io.Copy(outFile, rc)
+			outFile, err := os.Create(fpath)
+			if err != nil {
+				errChan <- err
+				return
+			}
 
-		outFile.Close()
-		rc.Close()
+			rc, err := f.Open()
+			if err != nil {
+				outFile.Close()
+				errChan <- err
+				return
+			}
 
+			_, err = io.Copy(outFile, rc)
+
+			outFile.Close()
+			rc.Close()
+
+			if err != nil {
+				errChan <- err
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	// return first error (ถ้ามี)
+	for err := range errChan {
 		if err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
