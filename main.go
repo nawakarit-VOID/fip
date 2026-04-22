@@ -2,11 +2,14 @@ package main
 
 import (
 	"archive/zip"
-	"bytes"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+
+	kzip "github.com/klauspost/compress/zip"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -15,119 +18,100 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// ===== ZIP (Worker Pool + Pipeline) =====
-type job struct {
-	path string
-	info os.FileInfo
-}
-
-type result struct {
-	header *zip.FileHeader
-	data   []byte
-	err    error
-}
-
-func zipFolder(source, target string) error {
+// ===== STREAMING ZIP (klauspost + faster) =====
+func zipFolder(ctx context.Context, source, target string, progress func(float64)) error {
 	zipfile, err := os.Create(target)
 	if err != nil {
 		return err
 	}
 	defer zipfile.Close()
 
-	archive := zip.NewWriter(zipfile)
+	archive := kzip.NewWriter(zipfile)
 	defer archive.Close()
 
-	jobs := make(chan job, 32)
-	results := make(chan result, 32)
-
-	// ===== workers (compress parallel) =====
-	workerCount := 4
-	var wg sync.WaitGroup
-
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := range jobs {
-				relPath, _ := filepath.Rel(source, j.path)
-
-				header, err := zip.FileInfoHeader(j.info)
-				if err != nil {
-					results <- result{err: err}
-					continue
-				}
-
-				header.Name = relPath
-
-				if j.info.IsDir() {
-					header.Name += "/"
-					results <- result{header: header}
-					continue
-				}
-
-				header.Method = zip.Deflate
-
-				file, err := os.Open(j.path)
-				if err != nil {
-					results <- result{err: err}
-					continue
-				}
-
-				var buf bytes.Buffer
-				_, err = io.Copy(&buf, file)
-				file.Close()
-
-				if err != nil {
-					results <- result{err: err}
-					continue
-				}
-
-				results <- result{header: header, data: buf.Bytes()}
-			}
-		}()
-	}
-
-	// walk files → send jobs
-	go func() {
-		filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			jobs <- job{path: path, info: info}
-			return nil
-		})
-		close(jobs)
-	}()
-
-	// close results after workers done
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// ===== writer (sequential) =====
-	for res := range results {
-		if res.err != nil {
-			return res.err
+	// total size
+	var total int64
+	filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			total += info.Size()
 		}
+		return nil
+	})
 
-		writer, err := archive.CreateHeader(res.header)
+	var done int64
+
+	err = filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
-		if res.data != nil {
-			_, err = writer.Write(res.data)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		header, err := kzip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+
+		relPath, _ := filepath.Rel(source, path)
+		header.Name = relPath
+
+		if info.IsDir() {
+			header.Name += "/"
+			_, err := archive.CreateHeader(header)
+			return err
+		}
+
+		// faster deflate (klauspost optimized)
+		header.Method = kzip.Deflate
+
+		writer, err := archive.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		buf := make([]byte, 64*1024) // bigger buffer
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
+			n, err := file.Read(buf)
+			if n > 0 {
+				_, werr := writer.Write(buf[:n])
+				if werr != nil {
+					return werr
+				}
+				atomic.AddInt64(&done, int64(n))
+				if total > 0 && progress != nil {
+					progress(float64(done) / float64(total))
+				}
+			}
+			if err == io.EOF {
+				break
+			}
 			if err != nil {
 				return err
 			}
 		}
-	}
 
-	return nil
+		return nil
+	})
+
+	return err
 }
 
-// ===== UNZIP (Parallel) =====
 func unzip(src, dest string) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
@@ -135,6 +119,7 @@ func unzip(src, dest string) error {
 	}
 	defer r.Close()
 
+	// สร้างโฟลเดอร์จากชื่อ zip
 	base := filepath.Base(src)
 	name := base[:len(base)-len(filepath.Ext(base))]
 	dest = filepath.Join(dest, name)
@@ -143,9 +128,12 @@ func unzip(src, dest string) error {
 		return err
 	}
 
+	// ===== Parallel unzip =====
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(r.File))
-	sem := make(chan struct{}, 4)
+
+	// จำกัดจำนวน worker กัน disk ตัน
+	sem := make(chan struct{}, 4) // ปรับได้ตาม CPU/SSD
 
 	for _, f := range r.File {
 		f := f
@@ -195,6 +183,7 @@ func unzip(src, dest string) error {
 	wg.Wait()
 	close(errChan)
 
+	// return first error (ถ้ามี)
 	for err := range errChan {
 		if err != nil {
 			return err
@@ -215,6 +204,9 @@ func main() {
 	targetEntry.SetPlaceHolder("ปลายทาง")
 
 	status := widget.NewLabel("Ready")
+	progressBar := widget.NewProgressBar()
+
+	var cancel context.CancelFunc
 
 	browseSrc := widget.NewButton("เลือกต้นทาง", func() {
 		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
@@ -232,29 +224,42 @@ func main() {
 		}, w)
 	})
 
+	// วิธีที่นายใช้: w.SetOnDropped() ✔ ใช้ได้จริงใน Fyne v2
 	w.SetOnDropped(func(pos fyne.Position, uris []fyne.URI) {
 		if len(uris) > 0 {
 			sourceEntry.SetText(uris[0].Path())
 		}
 	})
 
+	// (เสริม) drop zone แบบ widget เผื่ออยากมีพื้นที่ให้ลากชัดๆ
+	drop := newDropZone(func(path string) {
+		sourceEntry.SetText(path)
+	})
+
 	zipBtn := widget.NewButton("ZIP", func() {
+		ctx, c := context.WithCancel(context.Background())
+		cancel = c
+
 		src := sourceEntry.Text
-		dstDir := targetEntry.Text
+		dst := filepath.Join(targetEntry.Text, filepath.Base(src)+".zip")
 
-		base := filepath.Base(src)
-		zipName := base + ".zip"
-		dst := filepath.Join(dstDir, zipName)
-
-		status.SetText("Zipping...")
 		go func() {
-			err := zipFolder(src, dst)
+			err := zipFolder(ctx, src, dst, func(p float64) {
+				progressBar.SetValue(p)
+			})
 			if err != nil {
 				status.SetText("Error: " + err.Error())
 			} else {
-				status.SetText("Done: " + dst)
+				status.SetText("Done")
 			}
 		}()
+	})
+
+	cancelBtn := widget.NewButton("Cancel", func() {
+		if cancel != nil {
+			cancel()
+			status.SetText("Cancelled")
+		}
 	})
 
 	unzipBtn := widget.NewButton("UNZIP", func() {
@@ -270,20 +275,49 @@ func main() {
 				status.SetText("Done")
 			}
 		}()
+
 	})
 
 	ui := container.NewVBox(
-		widget.NewLabel("Zip Tool (Worker Pool + Pipeline)"),
+		widget.NewLabel("Zip Tool (Drag & Drop รองรับ)"),
+		drop,
 		sourceEntry,
 		browseSrc,
 		targetEntry,
 		browseDst,
 		zipBtn,
 		unzipBtn,
+		cancelBtn,
+		progressBar,
+
 		status,
 	)
 
 	w.SetContent(ui)
-	w.Resize(fyne.NewSize(400, 300))
+	w.Resize(fyne.NewSize(400, 320))
 	w.ShowAndRun()
+}
+
+// ===== Drag & Drop Widget (optional) =====
+type dropZone struct {
+	widget.BaseWidget
+	onDrop func(string)
+}
+
+func newDropZone(onDrop func(string)) *dropZone {
+	d := &dropZone{onDrop: onDrop}
+	d.ExtendBaseWidget(d)
+	return d
+}
+
+func (d *dropZone) CreateRenderer() fyne.WidgetRenderer {
+	label := widget.NewLabel("📂 ลากไฟล์/โฟลเดอร์มาวางที่นี่")
+	return widget.NewSimpleRenderer(label)
+}
+
+// Fyne v2 file drop
+func (d *dropZone) DropFiles(pos fyne.Position, uris []fyne.URI) {
+	if len(uris) > 0 && d.onDrop != nil {
+		d.onDrop(uris[0].Path())
+	}
 }
