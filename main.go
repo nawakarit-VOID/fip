@@ -112,7 +112,7 @@ func main() {
 	w := a.NewWindow("Zip Tool")
 
 	sourceEntry := widget.NewEntry()
-	sourceEntry.SetPlaceHolder("เลือกไฟล์/โฟลเดอร์")
+	sourceEntry.SetPlaceHolder("ลากไฟล์/โฟลเดอร์มาวาง หรือกดเลือก")
 
 	targetEntry := widget.NewEntry()
 	targetEntry.SetPlaceHolder("ปลายทาง")
@@ -135,9 +135,20 @@ func main() {
 		}, w)
 	})
 
+	// Drag & Drop support
+	w.SetOnDropped(func(pos fyne.Position, uris []fyne.URI) {
+		if len(uris) > 0 {
+			sourceEntry.SetText(uris[0].Path())
+		}
+	})
+
 	zipBtn := widget.NewButton("ZIP", func() {
 		src := sourceEntry.Text
-		dst := targetEntry.Text + "/output.zip"
+		dstDir := targetEntry.Text
+
+		base := filepath.Base(src)
+		zipName := base + ".zip"
+		dst := filepath.Join(dstDir, zipName)
 
 		status.SetText("Zipping...")
 		go func() {
@@ -166,7 +177,7 @@ func main() {
 	})
 
 	ui := container.NewVBox(
-		widget.NewLabel("Simple Zip/Unzip Tool"),
+		widget.NewLabel("Zip Tool (Drag & Drop รองรับ)"),
 		sourceEntry,
 		browseSrc,
 		targetEntry,
