@@ -135,11 +135,16 @@ func main() {
 		}, w)
 	})
 
-	// Drag & Drop support
+	// วิธีที่นายใช้: w.SetOnDropped() ✔ ใช้ได้จริงใน Fyne v2
 	w.SetOnDropped(func(pos fyne.Position, uris []fyne.URI) {
 		if len(uris) > 0 {
 			sourceEntry.SetText(uris[0].Path())
 		}
+	})
+
+	// (เสริม) drop zone แบบ widget เผื่ออยากมีพื้นที่ให้ลากชัดๆ
+	drop := newDropZone(func(path string) {
+		sourceEntry.SetText(path)
 	})
 
 	zipBtn := widget.NewButton("ZIP", func() {
@@ -178,6 +183,7 @@ func main() {
 
 	ui := container.NewVBox(
 		widget.NewLabel("Zip Tool (Drag & Drop รองรับ)"),
+		drop,
 		sourceEntry,
 		browseSrc,
 		targetEntry,
@@ -188,6 +194,30 @@ func main() {
 	)
 
 	w.SetContent(ui)
-	w.Resize(fyne.NewSize(400, 300))
+	w.Resize(fyne.NewSize(400, 320))
 	w.ShowAndRun()
+}
+
+// ===== Drag & Drop Widget (optional) =====
+type dropZone struct {
+	widget.BaseWidget
+	onDrop func(string)
+}
+
+func newDropZone(onDrop func(string)) *dropZone {
+	d := &dropZone{onDrop: onDrop}
+	d.ExtendBaseWidget(d)
+	return d
+}
+
+func (d *dropZone) CreateRenderer() fyne.WidgetRenderer {
+	label := widget.NewLabel("📂 ลากไฟล์/โฟลเดอร์มาวางที่นี่")
+	return widget.NewSimpleRenderer(label)
+}
+
+// Fyne v2 file drop
+func (d *dropZone) DropFiles(pos fyne.Position, uris []fyne.URI) {
+	if len(uris) > 0 && d.onDrop != nil {
+		d.onDrop(uris[0].Path())
+	}
 }
