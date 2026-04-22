@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +15,18 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+// ===== ZIP (Worker Pool + Pipeline) =====
+type job struct {
+	path string
+	info os.FileInfo
+}
+
+type result struct {
+	header *zip.FileHeader
+	data   []byte
+	err    error
+}
+
 func zipFolder(source, target string) error {
 	zipfile, err := os.Create(target)
 	if err != nil {
@@ -24,49 +37,97 @@ func zipFolder(source, target string) error {
 	archive := zip.NewWriter(zipfile)
 	defer archive.Close()
 
-	return filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
+	jobs := make(chan job, 32)
+	results := make(chan result, 32)
 
-		header, err := zip.FileInfoHeader(info)
-		if err != nil {
-			return err
-		}
+	// ===== workers (compress parallel) =====
+	workerCount := 4
+	var wg sync.WaitGroup
 
-		relPath, err := filepath.Rel(source, path)
-		if err != nil {
-			return err
-		}
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				relPath, _ := filepath.Rel(source, j.path)
 
-		header.Name = relPath
+				header, err := zip.FileInfoHeader(j.info)
+				if err != nil {
+					results <- result{err: err}
+					continue
+				}
 
-		if info.IsDir() {
-			header.Name += "/"
-		} else {
-			header.Method = zip.Deflate
-		}
+				header.Name = relPath
 
-		writer, err := archive.CreateHeader(header)
-		if err != nil {
-			return err
-		}
+				if j.info.IsDir() {
+					header.Name += "/"
+					results <- result{header: header}
+					continue
+				}
 
-		if info.IsDir() {
+				header.Method = zip.Deflate
+
+				file, err := os.Open(j.path)
+				if err != nil {
+					results <- result{err: err}
+					continue
+				}
+
+				var buf bytes.Buffer
+				_, err = io.Copy(&buf, file)
+				file.Close()
+
+				if err != nil {
+					results <- result{err: err}
+					continue
+				}
+
+				results <- result{header: header, data: buf.Bytes()}
+			}
+		}()
+	}
+
+	// walk files → send jobs
+	go func() {
+		filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			jobs <- job{path: path, info: info}
 			return nil
+		})
+		close(jobs)
+	}()
+
+	// close results after workers done
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// ===== writer (sequential) =====
+	for res := range results {
+		if res.err != nil {
+			return res.err
 		}
 
-		file, err := os.Open(path)
+		writer, err := archive.CreateHeader(res.header)
 		if err != nil {
 			return err
 		}
-		defer file.Close()
 
-		_, err = io.Copy(writer, file)
-		return err
-	})
+		if res.data != nil {
+			_, err = writer.Write(res.data)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
+// ===== UNZIP (Parallel) =====
 func unzip(src, dest string) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
@@ -74,7 +135,6 @@ func unzip(src, dest string) error {
 	}
 	defer r.Close()
 
-	// สร้างโฟลเดอร์จากชื่อ zip
 	base := filepath.Base(src)
 	name := base[:len(base)-len(filepath.Ext(base))]
 	dest = filepath.Join(dest, name)
@@ -83,12 +143,9 @@ func unzip(src, dest string) error {
 		return err
 	}
 
-	// ===== Parallel unzip =====
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(r.File))
-
-	// จำกัดจำนวน worker กัน disk ตัน
-	sem := make(chan struct{}, 4) // ปรับได้ตาม CPU/SSD
+	sem := make(chan struct{}, 4)
 
 	for _, f := range r.File {
 		f := f
@@ -138,7 +195,6 @@ func unzip(src, dest string) error {
 	wg.Wait()
 	close(errChan)
 
-	// return first error (ถ้ามี)
 	for err := range errChan {
 		if err != nil {
 			return err
@@ -176,16 +232,10 @@ func main() {
 		}, w)
 	})
 
-	// วิธีที่นายใช้: w.SetOnDropped() ✔ ใช้ได้จริงใน Fyne v2
 	w.SetOnDropped(func(pos fyne.Position, uris []fyne.URI) {
 		if len(uris) > 0 {
 			sourceEntry.SetText(uris[0].Path())
 		}
-	})
-
-	// (เสริม) drop zone แบบ widget เผื่ออยากมีพื้นที่ให้ลากชัดๆ
-	drop := newDropZone(func(path string) {
-		sourceEntry.SetText(path)
 	})
 
 	zipBtn := widget.NewButton("ZIP", func() {
@@ -223,8 +273,7 @@ func main() {
 	})
 
 	ui := container.NewVBox(
-		widget.NewLabel("Zip Tool (Drag & Drop รองรับ)"),
-		drop,
+		widget.NewLabel("Zip Tool (Worker Pool + Pipeline)"),
 		sourceEntry,
 		browseSrc,
 		targetEntry,
@@ -235,30 +284,6 @@ func main() {
 	)
 
 	w.SetContent(ui)
-	w.Resize(fyne.NewSize(400, 320))
+	w.Resize(fyne.NewSize(400, 300))
 	w.ShowAndRun()
-}
-
-// ===== Drag & Drop Widget (optional) =====
-type dropZone struct {
-	widget.BaseWidget
-	onDrop func(string)
-}
-
-func newDropZone(onDrop func(string)) *dropZone {
-	d := &dropZone{onDrop: onDrop}
-	d.ExtendBaseWidget(d)
-	return d
-}
-
-func (d *dropZone) CreateRenderer() fyne.WidgetRenderer {
-	label := widget.NewLabel("📂 ลากไฟล์/โฟลเดอร์มาวางที่นี่")
-	return widget.NewSimpleRenderer(label)
-}
-
-// Fyne v2 file drop
-func (d *dropZone) DropFiles(pos fyne.Position, uris []fyne.URI) {
-	if len(uris) > 0 && d.onDrop != nil {
-		d.onDrop(uris[0].Path())
-	}
 }
