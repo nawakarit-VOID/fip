@@ -1,0 +1,8 @@
+go run main.go pack test.myfmt file1.txt file2.txt
+go run main.go unpack test.myfmt out/
+
+go run main.go pack file.myfmt 
+unpack file.myfmt out/ myfile.txt
+
+go run main.go pack test.myfmt file1.txt file2.txt
+go run main.go unpack file.myfmt output_dir file1.txt

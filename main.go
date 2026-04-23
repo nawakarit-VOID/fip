@@ -7,21 +7,20 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
-	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
 
 const BlockSize = 1 << 20 // 1MB
 
-// ===== Block =====
-type Block struct {
-	Index int
-	Data  []byte
+// ===== Structures =====
+type FileMeta struct {
+	Name       string
+	StartBlock uint32
+	EndBlock   uint32
 }
 
-// ===== PACK (streaming + parallel) =====
+// ===== PACK (SOLID COMPRESSION) =====
 func pack(output string, files []string) error {
 	out, err := os.Create(output)
 	if err != nil {
@@ -34,114 +33,147 @@ func pack(output string, files []string) error {
 
 	enc, _ := zstd.NewWriter(nil)
 
-	jobs := make(chan Block, 16)
-	results := make(chan Block, 16)
+	var metas []FileMeta
+	var solidBuffer []byte
+	blockIndex := 0
 
-	// ===== workers =====
-	var wg sync.WaitGroup
-	workerCount := runtime.NumCPU()
+	for _, f := range files {
+		data, _ := os.ReadFile(f)
 
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for job := range jobs {
-				compressed := enc.EncodeAll(job.Data, nil)
-				results <- Block{Index: job.Index, Data: compressed}
-			}
-		}()
+		start := blockIndex
+
+		// append to solid buffer
+		solidBuffer = append(solidBuffer, data...)
+
+		// split into blocks AFTER combining
+		for len(solidBuffer) >= BlockSize {
+			chunk := solidBuffer[:BlockSize]
+			compressed := enc.EncodeAll(chunk, nil)
+
+			binary.Write(writer, binary.LittleEndian, uint32(len(compressed)))
+			writer.Write(compressed)
+
+			solidBuffer = solidBuffer[BlockSize:]
+			blockIndex++
+		}
+
+		end := blockIndex
+
+		metas = append(metas, FileMeta{
+			Name:       filepath.Base(f),
+			StartBlock: uint32(start),
+			EndBlock:   uint32(end),
+		})
 	}
 
-	// close results
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// ===== read + split =====
-	go func() {
-		idx := 0
-		for _, f := range files {
-			file, _ := os.Open(f)
-			defer file.Close()
-
-			buf := make([]byte, BlockSize)
-			for {
-				n, err := file.Read(buf)
-				if n > 0 {
-					chunk := make([]byte, n)
-					copy(chunk, buf[:n])
-					jobs <- Block{Index: idx, Data: chunk}
-					idx++
-				}
-				if err == io.EOF {
-					break
-				}
-			}
-		}
-		close(jobs)
-	}()
-
-	// ===== ordered write =====
-	buffer := make(map[int][]byte)
-	expected := 0
-
-	for res := range results {
-		buffer[res.Index] = res.Data
-
-		for {
-			data, ok := buffer[expected]
-			if !ok {
-				break
-			}
-
-			binary.Write(writer, binary.LittleEndian, uint32(len(data)))
-			writer.Write(data)
-
-			delete(buffer, expected)
-			expected++
-		}
+	// flush remaining buffer
+	if len(solidBuffer) > 0 {
+		compressed := enc.EncodeAll(solidBuffer, nil)
+		binary.Write(writer, binary.LittleEndian, uint32(len(compressed)))
+		writer.Write(compressed)
 	}
 
-	fmt.Println("Packed:", output)
+	// ===== write metadata at end =====
+	metaStart, _ := out.Seek(0, io.SeekCurrent)
+
+	binary.Write(writer, binary.LittleEndian, uint32(len(metas)))
+	for _, m := range metas {
+		nameBytes := []byte(m.Name)
+		binary.Write(writer, binary.LittleEndian, uint16(len(nameBytes)))
+		writer.Write(nameBytes)
+		binary.Write(writer, binary.LittleEndian, m.StartBlock)
+		binary.Write(writer, binary.LittleEndian, m.EndBlock)
+	}
+
+	binary.Write(writer, binary.LittleEndian, metaStart)
+
+	fmt.Println("Packed (SOLID):", output)
 	return nil
 }
 
-// ===== UNPACK =====
-func unpack(input, dest string) error {
+// ===== UNPACK (SOLID) =====
+func unpack(input, dest, targetFile string) error {
 	f, err := os.Open(input)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	reader := bufio.NewReader(f)
 	dec, _ := zstd.NewReader(nil)
 
-	os.MkdirAll(dest, os.ModePerm)
+	// read meta position
+	stat, _ := f.Stat()
+	f.Seek(stat.Size()-8, io.SeekStart)
 
-	outFile, _ := os.Create(filepath.Join(dest, "output.bin"))
+	var metaStart int64
+	binary.Read(f, binary.LittleEndian, &metaStart)
+
+	f.Seek(metaStart, io.SeekStart)
+
+	var count uint32
+	binary.Read(f, binary.LittleEndian, &count)
+
+	var metas []FileMeta
+
+	for i := 0; i < int(count); i++ {
+		var nameLen uint16
+		binary.Read(f, binary.LittleEndian, &nameLen)
+
+		nameBytes := make([]byte, nameLen)
+		f.Read(nameBytes)
+
+		var start, end uint32
+		binary.Read(f, binary.LittleEndian, &start)
+		binary.Read(f, binary.LittleEndian, &end)
+
+		metas = append(metas, FileMeta{
+			Name:       string(nameBytes),
+			StartBlock: start,
+			EndBlock:   end,
+		})
+	}
+
+	var target *FileMeta
+	for i := range metas {
+		if metas[i].Name == targetFile {
+			target = &metas[i]
+			break
+		}
+	}
+
+	if target == nil {
+		return fmt.Errorf("file not found")
+	}
+
+	// go to beginning
+	f.Seek(0, io.SeekStart)
+	reader := bufio.NewReader(f)
+
+	os.MkdirAll(dest, os.ModePerm)
+	outFile, _ := os.Create(filepath.Join(dest, target.Name))
 	defer outFile.Close()
+
+	currentBlock := 0
 
 	for {
 		var size uint32
 		err := binary.Read(reader, binary.LittleEndian, &size)
-		if err == io.EOF {
+		if err != nil {
 			break
 		}
 
 		buf := make([]byte, size)
 		io.ReadFull(reader, buf)
 
-		decompressed, err := dec.DecodeAll(buf, nil)
-		if err != nil {
-			return err
+		if currentBlock >= int(target.StartBlock) && currentBlock <= int(target.EndBlock) {
+			decompressed, _ := dec.DecodeAll(buf, nil)
+			outFile.Write(decompressed)
 		}
 
-		outFile.Write(decompressed)
+		currentBlock++
 	}
 
-	fmt.Println("Unpacked to:", dest)
+	fmt.Println("Extracted (SOLID):", target.Name)
 	return nil
 }
 
@@ -150,21 +182,15 @@ func main() {
 	if len(os.Args) < 3 {
 		fmt.Println("Usage:")
 		fmt.Println("  pack output.myfmt file1 file2 ...")
-		fmt.Println("  unpack file.myfmt output_dir")
+		fmt.Println("  unpack file.myfmt output_dir filename")
 		return
 	}
 
-	cmd := os.Args[1]
-
-	switch cmd {
+	switch os.Args[1] {
 	case "pack":
-		output := os.Args[2]
-		files := os.Args[3:]
-		pack(output, files)
+		pack(os.Args[2], os.Args[3:])
 
 	case "unpack":
-		input := os.Args[2]
-		dest := os.Args[3]
-		unpack(input, dest)
+		unpack(os.Args[2], os.Args[3], os.Args[4])
 	}
 }
