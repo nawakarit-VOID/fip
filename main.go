@@ -1,71 +1,113 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
 
-// ===== File Entry =====
-type FileEntry struct {
-	Name string
-	Size uint64
+const BlockSize = 1 << 20 // 1MB
+
+// ===== Block =====
+type Block struct {
+	Index int
+	Data  []byte
 }
 
-// ===== Pack =====
+// ===== PACK (streaming + parallel) =====
 func pack(output string, files []string) error {
-	var table []FileEntry
-	var combined bytes.Buffer
-
-	// collect data
-	for _, f := range files {
-		data, err := os.ReadFile(f)
-		if err != nil {
-			return err
-		}
-
-		table = append(table, FileEntry{
-			Name: filepath.Base(f),
-			Size: uint64(len(data)),
-		})
-
-		combined.Write(data)
-	}
-
-	// compress
-	enc, _ := zstd.NewWriter(nil)
-	compressed := enc.EncodeAll(combined.Bytes(), nil)
-
 	out, err := os.Create(output)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
 
-	// write header
-	binary.Write(out, binary.LittleEndian, uint32(len(table)))
+	writer := bufio.NewWriter(out)
+	defer writer.Flush()
 
-	// write file table
-	for _, e := range table {
-		nameBytes := []byte(e.Name)
-		binary.Write(out, binary.LittleEndian, uint16(len(nameBytes)))
-		out.Write(nameBytes)
-		binary.Write(out, binary.LittleEndian, e.Size)
+	enc, _ := zstd.NewWriter(nil)
+
+	jobs := make(chan Block, 16)
+	results := make(chan Block, 16)
+
+	// ===== workers =====
+	var wg sync.WaitGroup
+	workerCount := runtime.NumCPU()
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				compressed := enc.EncodeAll(job.Data, nil)
+				results <- Block{Index: job.Index, Data: compressed}
+			}
+		}()
 	}
 
-	// write data
-	out.Write(compressed)
+	// close results
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// ===== read + split =====
+	go func() {
+		idx := 0
+		for _, f := range files {
+			file, _ := os.Open(f)
+			defer file.Close()
+
+			buf := make([]byte, BlockSize)
+			for {
+				n, err := file.Read(buf)
+				if n > 0 {
+					chunk := make([]byte, n)
+					copy(chunk, buf[:n])
+					jobs <- Block{Index: idx, Data: chunk}
+					idx++
+				}
+				if err == io.EOF {
+					break
+				}
+			}
+		}
+		close(jobs)
+	}()
+
+	// ===== ordered write =====
+	buffer := make(map[int][]byte)
+	expected := 0
+
+	for res := range results {
+		buffer[res.Index] = res.Data
+
+		for {
+			data, ok := buffer[expected]
+			if !ok {
+				break
+			}
+
+			binary.Write(writer, binary.LittleEndian, uint32(len(data)))
+			writer.Write(data)
+
+			delete(buffer, expected)
+			expected++
+		}
+	}
 
 	fmt.Println("Packed:", output)
 	return nil
 }
 
-// ===== Unpack =====
+// ===== UNPACK =====
 func unpack(input, dest string) error {
 	f, err := os.Open(input)
 	if err != nil {
@@ -73,44 +115,30 @@ func unpack(input, dest string) error {
 	}
 	defer f.Close()
 
-	var count uint32
-	binary.Read(f, binary.LittleEndian, &count)
-
-	var table []FileEntry
-
-	for i := 0; i < int(count); i++ {
-		var nameLen uint16
-		binary.Read(f, binary.LittleEndian, &nameLen)
-
-		nameBytes := make([]byte, nameLen)
-		f.Read(nameBytes)
-
-		var size uint64
-		binary.Read(f, binary.LittleEndian, &size)
-
-		table = append(table, FileEntry{
-			Name: string(nameBytes),
-			Size: size,
-		})
-	}
-
-	compressed, _ := io.ReadAll(f)
-
+	reader := bufio.NewReader(f)
 	dec, _ := zstd.NewReader(nil)
-	decompressed, err := dec.DecodeAll(compressed, nil)
-	if err != nil {
-		return err
-	}
 
-	// split files
-	offset := 0
-	for _, e := range table {
-		data := decompressed[offset : offset+int(e.Size)]
-		err := os.WriteFile(filepath.Join(dest, e.Name), data, 0644)
+	os.MkdirAll(dest, os.ModePerm)
+
+	outFile, _ := os.Create(filepath.Join(dest, "output.bin"))
+	defer outFile.Close()
+
+	for {
+		var size uint32
+		err := binary.Read(reader, binary.LittleEndian, &size)
+		if err == io.EOF {
+			break
+		}
+
+		buf := make([]byte, size)
+		io.ReadFull(reader, buf)
+
+		decompressed, err := dec.DecodeAll(buf, nil)
 		if err != nil {
 			return err
 		}
-		offset += int(e.Size)
+
+		outFile.Write(decompressed)
 	}
 
 	fmt.Println("Unpacked to:", dest)
@@ -132,18 +160,11 @@ func main() {
 	case "pack":
 		output := os.Args[2]
 		files := os.Args[3:]
-		err := pack(output, files)
-		if err != nil {
-			fmt.Println("Error:", err)
-		}
+		pack(output, files)
 
 	case "unpack":
 		input := os.Args[2]
 		dest := os.Args[3]
-		os.MkdirAll(dest, os.ModePerm)
-		err := unpack(input, dest)
-		if err != nil {
-			fmt.Println("Error:", err)
-		}
+		unpack(input, dest)
 	}
 }
